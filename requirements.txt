@@ -1,5 +1,5 @@
-# Audio capture (WASAPI loopback on Windows)
-soundcard>=0.4.0
+# Audio capture (WASAPI loopback + microphone on Windows)
+PyAudioWPatch>=0.2.12
 
 # Transcription
 faster-whisper>=1.1.0
