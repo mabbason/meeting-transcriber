@@ -1,0 +1,25 @@
+# Audio capture (WASAPI loopback on Windows)
+soundcard>=0.4.0
+
+# Transcription
+faster-whisper>=1.1.0
+
+# Speaker diarization (optional, requires HF_TOKEN)
+pyannote.audio>=3.3.0
+
+# PyTorch — install separately with CUDA support:
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+# torch>=2.0.0
+# torchaudio>=2.0.0
+
+# Audio processing
+numpy>=1.26.0
+soundfile>=0.12.0
+
+# Web server
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0
+websockets>=14.0
+
+# Configuration
+python-dotenv>=1.0.0

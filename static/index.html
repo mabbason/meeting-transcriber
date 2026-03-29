@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Meeting Transcriber</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app">
+        <header>
+            <h1>Meeting Transcriber</h1>
+            <div class="controls">
+                <span id="status" class="status idle">Idle</span>
+                <span id="timer" class="timer">00:00:00</span>
+                <button id="btn-start" class="btn btn-start" onclick="startSession()">Start Recording</button>
+                <button id="btn-stop" class="btn btn-stop" onclick="stopSession()" disabled>Stop</button>
+            </div>
+        </header>
+
+        <div class="main">
+            <aside class="sidebar">
+                <h2>Sessions</h2>
+                <div id="session-list" class="session-list">
+                    <p class="empty">No sessions yet</p>
+                </div>
+            </aside>
+
+            <section class="transcript-panel">
+                <div id="transcript" class="transcript">
+                    <p class="placeholder">Start a recording or select a past session to view the transcript.</p>
+                </div>
+            </section>
+        </div>
+
+        <footer>
+            <div class="export-bar" id="export-bar" style="display:none">
+                <span>Export:</span>
+                <button class="btn btn-sm" onclick="exportSession('json')">JSON</button>
+                <button class="btn btn-sm" onclick="exportSession('txt')">TXT</button>
+                <button class="btn btn-sm" onclick="exportSession('srt')">SRT</button>
+            </div>
+            <div class="audio-status">
+                Audio: <span id="audio-status">Disconnected</span>
+            </div>
+        </footer>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
