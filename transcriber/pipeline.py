@@ -27,6 +27,7 @@ class TranscriptionPipeline:
         self.websocket_clients = set()
         self._loop = None
         self._processing_lock = None
+        self._last_end_time = 0.0  # Track last segment end to deduplicate overlaps
 
     def load_models(self):
         self.transcriber.load_model()
@@ -48,6 +49,7 @@ class TranscriptionPipeline:
 
         self._loop = asyncio.get_event_loop()
         self._processing_lock = asyncio.Lock()
+        self._last_end_time = 0.0
 
         # Start audio capture thread
         self.capture = AudioCapture(on_chunk_ready=self._on_chunk_from_thread)
@@ -84,10 +86,23 @@ class TranscriptionPipeline:
     def _on_chunk_from_thread(self, audio: np.ndarray, chunk_index: int, offset: float):
         """Called from the capture thread — schedules async processing on the event loop."""
         if self._loop and self.session:
-            asyncio.run_coroutine_threadsafe(
+            peak = np.max(np.abs(audio))
+            print(f"Chunk {chunk_index}: {len(audio)} samples, peak={peak:.4f}, offset={offset:.1f}s")
+            future = asyncio.run_coroutine_threadsafe(
                 self._process_chunk(audio, chunk_index, offset),
                 self._loop,
             )
+            # Check for errors (non-blocking)
+            future.add_done_callback(self._chunk_done_callback)
+
+    @staticmethod
+    def _chunk_done_callback(future):
+        try:
+            future.result()
+        except Exception as e:
+            print(f"Chunk processing error: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def _process_chunk(self, audio: np.ndarray, chunk_index: int, offset: float):
         if not self.session:
@@ -98,9 +113,13 @@ class TranscriptionPipeline:
             chunk_path = self.session["dir"] / f"chunk_{chunk_index:04d}.wav"
             sf.write(str(chunk_path), audio, config.AUDIO_SAMPLE_RATE)
 
+            peak = np.max(np.abs(audio))
             # Check if chunk has actual audio (not silence)
-            if np.max(np.abs(audio)) < 0.001:
+            if peak < 0.001:
+                print(f"  Chunk {chunk_index}: silence (peak={peak:.6f}), skipping")
                 return
+
+            print(f"  Chunk {chunk_index}: processing (peak={peak:.4f})...")
 
             loop = asyncio.get_event_loop()
 
@@ -125,10 +144,19 @@ class TranscriptionPipeline:
                 None, self.diarizer.diarize, audio, chunk_segments
             )
 
-            # Restore absolute timestamps
+            # Restore absolute timestamps and deduplicate overlap
             for seg in diarized:
                 seg["start"] = round(seg["start"] + offset, 1)
                 seg["end"] = round(seg["end"] + offset, 1)
+
+                # Skip segments that fall entirely within already-processed time
+                if seg["end"] <= self._last_end_time:
+                    continue
+                # Adjust start if it overlaps with previous
+                if seg["start"] < self._last_end_time:
+                    seg["start"] = self._last_end_time
+
+                self._last_end_time = seg["end"]
                 self.session["segments"].append(seg)
                 await self._broadcast(seg)
 
