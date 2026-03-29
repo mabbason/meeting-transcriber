@@ -30,7 +30,8 @@ Audio Capture (WASAPI loopback) → faster-whisper (CUDA) → pyannote diarizati
 ### 1. Install PyTorch with CUDA
 
 ```powershell
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+# For CUDA 12.4 (check your version with nvidia-smi)
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
 ```
 
 ### 2. Install dependencies
@@ -72,6 +73,7 @@ Click **Start Recording** to begin capturing and transcribing system audio.
 |----------|---------|-------------|
 | `WHISPER_MODEL` | `medium` | Whisper model size (tiny/base/small/medium/large-v3) |
 | `WHISPER_DEVICE` | `cuda` | Device (cuda/cpu) |
+| `WHISPER_COMPUTE_TYPE` | `int8_float32` | Quantization (int8_float32 for GTX, float16 for RTX 30+) |
 | `AUDIO_CHUNK_SECONDS` | `5` | Seconds per processing chunk (lower = less latency) |
 | `AUDIO_OVERLAP_SECONDS` | `0.5` | Overlap between chunks to avoid cutting words |
 | `WEB_PORT` | `8765` | Web UI port |
