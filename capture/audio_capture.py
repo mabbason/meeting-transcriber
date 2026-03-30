@@ -72,26 +72,25 @@ class AudioCapture:
             raise RuntimeError("No WASAPI loopback device found")
 
         # Find and open microphone stream
-        for i in range(self._pa.get_device_count()):
-            dev = self._pa.get_device_info_by_index(i)
-            if (dev["hostApi"] == wasapi["index"]
-                    and not dev.get("isLoopbackDevice", False)
-                    and dev["maxInputChannels"] > 0):
-                print(f"Microphone: {dev['name']}")
-                try:
-                    self._mic_stream = self._pa.open(
-                        format=pyaudio.paFloat32,
-                        channels=1,
-                        rate=NATIVE_RATE,
-                        input=True,
-                        input_device_index=i,
-                        frames_per_buffer=FRAME_SIZE,
-                        stream_callback=self._mic_callback,
-                    )
-                    self._has_mic = True
-                except Exception as e:
-                    print(f"Could not open mic: {e}")
-                break
+        mic_idx = self._find_best_mic(wasapi["index"])
+        if mic_idx is not None:
+            dev = self._pa.get_device_info_by_index(mic_idx)
+            print(f"Microphone: {dev['name']}")
+            try:
+                self._mic_stream = self._pa.open(
+                    format=pyaudio.paFloat32,
+                    channels=1,
+                    rate=NATIVE_RATE,
+                    input=True,
+                    input_device_index=mic_idx,
+                    frames_per_buffer=FRAME_SIZE,
+                    stream_callback=self._mic_callback,
+                )
+                self._has_mic = True
+            except Exception as e:
+                print(f"Could not open mic: {e}")
+        else:
+            print("WARNING: No working microphone found")
 
         self._mixer_thread = threading.Thread(target=self._mix_loop, daemon=True)
         self._mixer_thread.start()
@@ -123,6 +122,65 @@ class AudioCapture:
     @property
     def is_running(self):
         return self._lb_stream is not None and self._lb_stream.is_active()
+
+    def _find_best_mic(self, wasapi_host_idx):
+        """
+        Find the best microphone device. Priority:
+        1. Device matching AUDIO_MIC_DEVICE config (substring match)
+        2. Probe all mics for 1s and pick the loudest (auto-detect)
+        """
+        candidates = []
+        for i in range(self._pa.get_device_count()):
+            dev = self._pa.get_device_info_by_index(i)
+            if (dev["hostApi"] == wasapi_host_idx
+                    and not dev.get("isLoopbackDevice", False)
+                    and dev["maxInputChannels"] > 0):
+                candidates.append((i, dev["name"]))
+
+        if not candidates:
+            return None
+
+        # If user specified a device name, use it
+        if config.AUDIO_MIC_DEVICE:
+            for idx, name in candidates:
+                if config.AUDIO_MIC_DEVICE.lower() in name.lower():
+                    print(f"Mic (configured): {name}")
+                    return idx
+            print(f"WARNING: Configured mic '{config.AUDIO_MIC_DEVICE}' not found")
+
+        # Auto-detect: probe each mic for 1s, pick loudest
+        print("Auto-detecting microphone (probing 1s each)...")
+        best_idx = None
+        best_peak = 0
+
+        for idx, name in candidates:
+            try:
+                stream = self._pa.open(
+                    format=pyaudio.paFloat32, channels=1, rate=NATIVE_RATE,
+                    input=True, input_device_index=idx, frames_per_buffer=FRAME_SIZE,
+                )
+                frames = []
+                for _ in range(10):  # 1 second
+                    data = stream.read(FRAME_SIZE, exception_on_overflow=False)
+                    frames.append(np.frombuffer(data, dtype=np.float32))
+                stream.stop_stream()
+                stream.close()
+
+                audio = np.concatenate(frames)
+                peak = float(np.max(np.abs(audio)))
+                status = "active" if peak > 0.005 else "silent"
+                print(f"  [{idx}] {name}: peak={peak:.4f} ({status})")
+
+                if peak > best_peak:
+                    best_peak = peak
+                    best_idx = idx
+            except Exception as e:
+                print(f"  [{idx}] {name}: error - {e}")
+
+        if best_peak < 0.005:
+            print("WARNING: All microphones appear silent — check your mic or set AUDIO_MIC_DEVICE in .env")
+            # Still return the best one (might just be quiet room)
+        return best_idx
 
     def _make_lb_callback(self, channels):
         def callback(in_data, frame_count, time_info, status):

@@ -155,65 +155,96 @@ class TranscriptionPipeline:
             # Store trailing words for next chunk's dedup
             self._prev_words = all_words[-20:] if all_words else []
 
+    @staticmethod
+    def _normalize_word(w: str) -> str:
+        return w.strip().lower().rstrip(".,!?;:'\"").lstrip("'\"")
+
     def _dedup_words(self, new_words: list[dict]) -> list[dict]:
-        """Remove words from the start of new_words that overlap with previous chunk."""
+        """
+        Remove words from the start of new_words that overlap with the
+        previous chunk's trailing words.
+
+        Uses two strategies:
+        1. Timestamp-based: skip new words whose timestamps fall before the
+           last emitted word's end time.
+        2. Sequence alignment: find where a contiguous run of new words
+           matches a contiguous run in prev_words, and skip past it.
+        """
         if not self._prev_words or not new_words:
             return new_words
 
-        # Find where the new words stop overlapping with previous words.
-        # Compare by normalized word text and approximate timestamp.
-        prev_texts = [w["word"].strip().lower().rstrip(".,!?") for w in self._prev_words]
+        prev_texts = [self._normalize_word(w["word"]) for w in self._prev_words]
+        new_texts = [self._normalize_word(w["word"]) for w in new_words]
 
-        # Find the best alignment: look for a sequence of new words that matches
-        # a suffix of prev_words
-        best_skip = 0
+        # Strategy 1: timestamp — skip words before the last previous word's end
+        last_prev_end = self._prev_words[-1]["end"]
+        time_skip = 0
+        for i, w in enumerate(new_words):
+            if w["start"] < last_prev_end - 0.15:
+                time_skip = i + 1
+            else:
+                break
 
-        for skip in range(min(len(new_words), 15)):
-            new_word = new_words[skip]["word"].strip().lower().rstrip(".,!?")
-            # Check if this word matches any of the last prev words
-            if new_word in prev_texts[-10:]:
-                # Check if subsequent words also match (sequence match)
+        # Strategy 2: sequence alignment — find longest contiguous match
+        # between a suffix of prev_texts and a prefix of new_texts
+        seq_skip = 0
+        for start_p in range(max(0, len(prev_texts) - 15), len(prev_texts)):
+            # Try to align prev_texts[start_p:] with new_texts[0:]
+            match_len = 0
+            for j in range(min(len(prev_texts) - start_p, len(new_texts))):
+                if prev_texts[start_p + j] == new_texts[j]:
+                    match_len += 1
+                else:
+                    break
+
+            if match_len >= 2:
+                seq_skip = max(seq_skip, match_len)
+
+        # Also check: new words starting at offset > 0 matching prev suffix
+        for start_n in range(1, min(len(new_texts), 8)):
+            for start_p in range(max(0, len(prev_texts) - 10), len(prev_texts)):
                 match_len = 0
-                for j in range(skip, min(skip + 5, len(new_words))):
-                    nw = new_words[j]["word"].strip().lower().rstrip(".,!?")
-                    if nw in prev_texts:
+                for j in range(min(len(prev_texts) - start_p, len(new_texts) - start_n)):
+                    if prev_texts[start_p + j] == new_texts[start_n + j]:
                         match_len += 1
                     else:
                         break
-
                 if match_len >= 2:
-                    # Found an overlap sequence — skip these words
-                    best_skip = skip + match_len
+                    seq_skip = max(seq_skip, start_n + match_len)
+
+        best_skip = max(time_skip, seq_skip)
 
         if best_skip > 0:
             skipped = " ".join(w["word"].strip() for w in new_words[:best_skip])
-            print(f"  Dedup: skipped {best_skip} overlapping words: '{skipped}'")
+            print(f"  Dedup: skipped {best_skip} words (time={time_skip}, seq={seq_skip}): '{skipped}'")
 
         return new_words[best_skip:]
 
     def _words_to_segments(self, words: list[dict], original_segments: list[dict]) -> list[dict]:
         """
-        Rebuild segments from deduped words, preserving natural sentence boundaries
-        from the original Whisper segmentation.
+        Rebuild segments from deduped words. Uses original segment boundaries
+        where possible — a word belongs to a segment if its timestamp falls
+        within that segment's time range.
         """
         if not words:
             return []
 
-        # Use original segment boundaries where they align with our word list
+        # Build a map: for each original segment, collect deduped words that fall within it
         segments = []
-        word_idx = 0
+        used = set()
 
         for orig_seg in original_segments:
+            seg_start = orig_seg["start"]
+            seg_end = orig_seg["end"]
             seg_words = []
-            orig_seg_words = orig_seg.get("words", [])
 
-            for ow in orig_seg_words:
-                if word_idx >= len(words):
-                    break
-                # Match by timestamp proximity
-                if abs(words[word_idx]["start"] - ow["start"]) < 0.3:
-                    seg_words.append(words[word_idx])
-                    word_idx += 1
+            for i, w in enumerate(words):
+                if i in used:
+                    continue
+                # Word falls within this segment's time range (with tolerance)
+                if w["start"] >= seg_start - 0.2 and w["start"] <= seg_end + 0.2:
+                    seg_words.append(w)
+                    used.add(i)
 
             if seg_words:
                 text = "".join(w["word"] for w in seg_words).strip()
@@ -225,9 +256,9 @@ class TranscriptionPipeline:
                         "words": seg_words,
                     })
 
-        # Any remaining words that didn't match original boundaries
-        if word_idx < len(words):
-            remaining = words[word_idx:]
+        # Any remaining unmatched words
+        remaining = [w for i, w in enumerate(words) if i not in used]
+        if remaining:
             text = "".join(w["word"] for w in remaining).strip()
             if text:
                 segments.append({
