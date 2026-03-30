@@ -197,30 +197,27 @@ class AudioCapture:
             self._stop_event.wait(timeout=0.1)
 
             with self._lock:
-                # Find how many samples all sources have
-                lengths = [len(self._buffers[idx]) for idx in self._selected_devices
-                           if idx in self._buffers]
-                if not lengths:
+                # Collect all sources that have data
+                active_chunks = []
+                for idx in self._selected_devices:
+                    if idx in self._buffers and len(self._buffers[idx]) > 0:
+                        active_chunks.append((idx, len(self._buffers[idx])))
+
+                if not active_chunks:
                     continue
 
-                if n_sources == 1:
-                    # Single source — just take everything
-                    idx = self._selected_devices[0]
-                    if len(self._buffers[idx]) == 0:
-                        continue
+                if len(active_chunks) == 1:
+                    # Only one source has data — use it directly
+                    idx = active_chunks[0][0]
                     new_audio = self._buffers[idx].copy()
                     self._buffers[idx] = np.array([], dtype=np.float32)
                 else:
-                    # Multiple sources — take min available across all
-                    n = min(lengths)
-                    if n == 0:
-                        continue
+                    # Multiple sources have data — take min available and mix
+                    n = min(length for _, length in active_chunks)
                     chunks = []
-                    for idx in self._selected_devices:
-                        if idx in self._buffers:
-                            chunks.append(self._buffers[idx][:n].copy())
-                            self._buffers[idx] = self._buffers[idx][n:]
-                    # Mix: sum all sources, clip to [-1, 1] only if needed
+                    for idx, _ in active_chunks:
+                        chunks.append(self._buffers[idx][:n].copy())
+                        self._buffers[idx] = self._buffers[idx][n:]
                     new_audio = np.sum(chunks, axis=0)
                     peak = np.max(np.abs(new_audio))
                     if peak > 1.0:
