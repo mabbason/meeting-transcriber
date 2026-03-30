@@ -6,6 +6,35 @@ let startTime = null;
 let viewingSessionId = null;
 let availableDevices = [];
 
+// --- Toast ---
+
+function showToast(message, duration = 3000) {
+    const toast = document.getElementById('toast');
+    toast.textContent = message;
+    toast.classList.add('show');
+    setTimeout(() => toast.classList.remove('show'), duration);
+}
+
+// --- Collapsible sections ---
+
+function toggleSection(name) {
+    const body = document.getElementById(`section-${name}`);
+    const chevron = document.getElementById(`chevron-${name}`);
+    body.classList.toggle('collapsed');
+    chevron.classList.toggle('collapsed');
+    localStorage.setItem(`section-${name}-collapsed`, body.classList.contains('collapsed'));
+}
+
+function restoreSectionStates() {
+    for (const name of ['devices', 'sessions']) {
+        const collapsed = localStorage.getItem(`section-${name}-collapsed`) === 'true';
+        if (collapsed) {
+            document.getElementById(`section-${name}`).classList.add('collapsed');
+            document.getElementById(`chevron-${name}`).classList.add('collapsed');
+        }
+    }
+}
+
 function connectWebSocket() {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${protocol}//${location.host}/ws`);
@@ -144,11 +173,17 @@ async function stopSession() {
     // Re-enable device checkboxes
     document.querySelectorAll('#device-list input[type="checkbox"]').forEach(cb => cb.disabled = false);
 
-    if (viewingSessionId) {
+    clearInterval(timerInterval);
+
+    if (data.segment_count === 0) {
+        showToast('No audio segments detected');
+        viewingSessionId = null;
+        document.getElementById('transcript').innerHTML = '<p class="placeholder">Start a recording or select a past session to view the transcript.</p>';
+        document.getElementById('export-bar').style.display = 'none';
+    } else if (viewingSessionId) {
         document.getElementById('export-bar').style.display = 'flex';
     }
 
-    clearInterval(timerInterval);
     loadSessions();
 }
 
@@ -278,6 +313,7 @@ async function pollStatus() {
 }
 
 // Initialize
+restoreSectionStates();
 connectWebSocket();
 loadDevices();
 loadSessions();

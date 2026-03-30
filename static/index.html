@@ -20,15 +20,27 @@
 
         <div class="main">
             <aside class="sidebar">
-                <div class="device-panel">
-                    <h2>Audio Sources</h2>
-                    <div id="device-list" class="device-list">
-                        <p class="empty">Loading...</p>
+                <div class="sidebar-section">
+                    <h2 class="section-header" onclick="toggleSection('devices')">
+                        <span class="chevron" id="chevron-devices">&#9660;</span>
+                        Audio Sources
+                    </h2>
+                    <div id="section-devices" class="section-body">
+                        <div id="device-list" class="device-list">
+                            <p class="empty">Loading...</p>
+                        </div>
                     </div>
                 </div>
-                <h2>Sessions</h2>
-                <div id="session-list" class="session-list">
-                    <p class="empty">No sessions yet</p>
+                <div class="sidebar-section">
+                    <h2 class="section-header" onclick="toggleSection('sessions')">
+                        <span class="chevron" id="chevron-sessions">&#9660;</span>
+                        Sessions
+                    </h2>
+                    <div id="section-sessions" class="section-body">
+                        <div id="session-list" class="session-list">
+                            <p class="empty">No sessions yet</p>
+                        </div>
+                    </div>
                 </div>
             </aside>
 
@@ -51,6 +63,8 @@
             </div>
         </footer>
     </div>
+
+    <div id="toast" class="toast"></div>
 
     <script src="/static/app.js"></script>
 </body>

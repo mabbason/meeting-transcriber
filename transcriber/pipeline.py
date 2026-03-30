@@ -96,16 +96,25 @@ class TranscriptionPipeline:
             self.capture = None
 
         self.session["ended_at"] = datetime.now().isoformat()
-        self._save_transcript()
+        segment_count = len(self.session["segments"])
+
+        if segment_count > 0:
+            self._save_transcript()
+        else:
+            # Remove empty session directory
+            import shutil
+            session_dir = self.session["dir"]
+            if session_dir.exists():
+                shutil.rmtree(session_dir)
 
         result = {
             "id": self.session["id"],
             "started_at": self.session["started_at"],
             "ended_at": self.session["ended_at"],
-            "segment_count": len(self.session["segments"]),
+            "segment_count": segment_count,
         }
 
-        print(f"Session stopped: {self.session['id']} ({len(self.session['segments'])} segments)")
+        print(f"Session stopped: {self.session['id']} ({segment_count} segments)")
         self.session = None
         return result
 
