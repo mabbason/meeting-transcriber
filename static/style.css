@@ -106,16 +106,40 @@ header h1 { font-size: 18px; font-weight: 600; }
 .session-list { flex: 1; overflow-y: auto; }
 
 .session-item {
-    padding: 10px 16px;
-    cursor: pointer;
+    display: flex;
+    align-items: center;
+    padding: 0;
     border-bottom: 1px solid rgba(255,255,255,0.05);
     transition: background 0.15s;
 }
 
 .session-item:hover { background: var(--surface2); }
 .session-item.active { background: var(--surface2); border-left: 3px solid var(--accent); }
-.session-item .date { font-size: 13px; }
-.session-item .meta { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+
+.session-row { flex: 1; padding: 10px 8px 10px 16px; cursor: pointer; }
+.session-row .date { font-size: 13px; }
+.session-row .meta { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+
+.btn-delete {
+    width: 24px;
+    height: 24px;
+    border: none;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--text-dim);
+    font-size: 16px;
+    line-height: 24px;
+    cursor: pointer;
+    opacity: 0.25;
+    transition: opacity 0.2s, background 0.2s, color 0.2s;
+    margin-right: 10px;
+    flex-shrink: 0;
+}
+.btn-delete:hover {
+    opacity: 1;
+    background: var(--accent);
+    color: white;
+}
 
 .transcript-panel {
     flex: 1;

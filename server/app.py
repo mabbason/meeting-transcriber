@@ -9,6 +9,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+import config
+
 from transcriber.pipeline import TranscriptionPipeline
 
 app = FastAPI(title="Meeting Transcriber")
@@ -62,6 +64,16 @@ async def get_session(session_id: str):
     if data is None:
         return JSONResponse({"error": "Session not found"}, status_code=404)
     return JSONResponse(data)
+
+
+@app.delete("/api/sessions/{session_id}")
+async def delete_session(session_id: str):
+    import shutil
+    session_dir = config.SESSIONS_DIR / session_id
+    if not session_dir.exists():
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    shutil.rmtree(session_dir)
+    return JSONResponse({"deleted": session_id})
 
 
 @app.get("/api/sessions/{session_id}/export/{fmt}")

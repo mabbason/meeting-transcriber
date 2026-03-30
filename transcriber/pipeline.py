@@ -12,7 +12,7 @@ import numpy as np
 import soundfile as sf
 
 import config
-from capture.audio_capture import AudioCapture
+from capture.audio_capture import AudioCapture, discover_devices
 from transcriber.transcription import Transcriber
 from transcriber.diarization import Diarizer
 
@@ -26,11 +26,20 @@ class TranscriptionPipeline:
         self.websocket_clients = set()
         self._loop = None
         self._processing_lock = None
-        self._prev_words = []  # Word-level output from previous chunk for dedup
+        self._prev_words = []
+        self._lb_idx = None
+        self._lb_ch = None
+        self._mic_idx = None
 
     def load_models(self):
         self.transcriber.load_model()
         self.diarizer.load_model()
+
+        print("Discovering audio devices...")
+        self._lb_idx, self._lb_ch, self._mic_idx = discover_devices()
+        if self._lb_idx is None:
+            print("ERROR: No WASAPI loopback device found")
+        print()
 
     def start_session(self) -> dict:
         now = datetime.now()
@@ -50,7 +59,12 @@ class TranscriptionPipeline:
         self._processing_lock = asyncio.Lock()
         self._prev_words = []
 
-        self.capture = AudioCapture(on_chunk_ready=self._on_chunk_from_thread)
+        self.capture = AudioCapture(
+            on_chunk_ready=self._on_chunk_from_thread,
+            lb_idx=self._lb_idx,
+            lb_ch=self._lb_ch,
+            mic_idx=self._mic_idx,
+        )
         self.capture.start()
 
         print(f"Session started: {session_id}")

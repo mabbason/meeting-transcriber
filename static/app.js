@@ -134,9 +134,12 @@ async function loadSessions() {
         });
         const active = s.id === viewingSessionId ? ' active' : '';
         return `
-            <div class="session-item${active}" onclick="viewSession('${s.id}')">
-                <div class="date">${dateStr}</div>
-                <div class="meta">${s.segment_count} segments</div>
+            <div class="session-item${active}">
+                <div class="session-row" onclick="viewSession('${s.id}')">
+                    <div class="date">${dateStr}</div>
+                    <div class="meta">${s.segment_count} segments</div>
+                </div>
+                <button class="btn-delete" onclick="event.stopPropagation(); deleteSession('${s.id}')" title="Delete session">&times;</button>
             </div>
         `;
     }).join('');
@@ -158,6 +161,17 @@ async function viewSession(sessionId) {
 
     document.getElementById('export-bar').style.display = 'flex';
     loadSessions(); // Refresh to update active highlight
+}
+
+async function deleteSession(sessionId) {
+    if (!confirm('Delete this recording?')) return;
+    await fetch(`/api/sessions/${sessionId}`, { method: 'DELETE' });
+    if (viewingSessionId === sessionId) {
+        viewingSessionId = null;
+        document.getElementById('transcript').innerHTML = '<p class="placeholder">Start a recording or select a past session to view the transcript.</p>';
+        document.getElementById('export-bar').style.display = 'none';
+    }
+    loadSessions();
 }
 
 function exportSession(fmt) {

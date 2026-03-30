@@ -2,6 +2,9 @@
 Audio capture using PyAudioWPatch (WASAPI).
 Captures system audio loopback and microphone, mixes into mono.
 Uses VAD-based chunking: splits on natural speech pauses instead of fixed intervals.
+
+Device discovery happens once at init (slow probe).
+Session start/stop just opens/closes streams (instant).
 """
 
 import threading
@@ -14,10 +17,96 @@ NATIVE_RATE = 48000
 FRAME_SIZE = 4800  # 100ms at 48kHz
 
 
+def discover_devices():
+    """
+    Probe all WASAPI devices and select the best loopback + mic.
+    Called once at server startup. Returns (loopback_idx, loopback_channels, mic_idx).
+    """
+    p = pyaudio.PyAudio()
+    wasapi = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+
+    lb_idx = None
+    lb_ch = None
+    mic_idx = None
+
+    # Find first loopback device
+    for i in range(p.get_device_count()):
+        dev = p.get_device_info_by_index(i)
+        if dev["hostApi"] == wasapi["index"] and dev.get("isLoopbackDevice", False):
+            lb_idx = i
+            lb_ch = dev["maxInputChannels"]
+            print(f"  Loopback: {dev['name']} ({lb_ch}ch)")
+            break
+
+    # Find best microphone
+    if config.AUDIO_MIC_DEVICE:
+        # User specified a device name
+        for i in range(p.get_device_count()):
+            dev = p.get_device_info_by_index(i)
+            if (dev["hostApi"] == wasapi["index"]
+                    and not dev.get("isLoopbackDevice", False)
+                    and dev["maxInputChannels"] > 0
+                    and config.AUDIO_MIC_DEVICE.lower() in dev["name"].lower()):
+                mic_idx = i
+                print(f"  Microphone (configured): {dev['name']}")
+                break
+        if mic_idx is None:
+            print(f"  WARNING: Configured mic '{config.AUDIO_MIC_DEVICE}' not found")
+
+    if mic_idx is None:
+        # Auto-detect: probe each mic for 0.5s, pick loudest
+        candidates = []
+        for i in range(p.get_device_count()):
+            dev = p.get_device_info_by_index(i)
+            if (dev["hostApi"] == wasapi["index"]
+                    and not dev.get("isLoopbackDevice", False)
+                    and dev["maxInputChannels"] > 0):
+                candidates.append((i, dev["name"]))
+
+        if candidates:
+            print("  Auto-detecting microphone...")
+            best_peak = 0
+            for idx, name in candidates:
+                try:
+                    stream = p.open(
+                        format=pyaudio.paFloat32, channels=1, rate=NATIVE_RATE,
+                        input=True, input_device_index=idx, frames_per_buffer=FRAME_SIZE,
+                    )
+                    frames = []
+                    for _ in range(5):  # 0.5 second
+                        data = stream.read(FRAME_SIZE, exception_on_overflow=False)
+                        frames.append(np.frombuffer(data, dtype=np.float32))
+                    stream.stop_stream()
+                    stream.close()
+
+                    audio = np.concatenate(frames)
+                    peak = float(np.max(np.abs(audio)))
+                    status = "active" if peak > 0.005 else "silent"
+                    print(f"    [{idx}] {name}: peak={peak:.4f} ({status})")
+
+                    if peak > best_peak:
+                        best_peak = peak
+                        mic_idx = idx
+                except Exception as e:
+                    print(f"    [{idx}] {name}: error - {e}")
+
+            if mic_idx is not None:
+                dev = p.get_device_info_by_index(mic_idx)
+                print(f"  Selected mic: {dev['name']}")
+            if best_peak < 0.005:
+                print("  WARNING: All mics appear silent — set AUDIO_MIC_DEVICE in .env")
+
+    p.terminate()
+    return lb_idx, lb_ch, mic_idx
+
+
 class AudioCapture:
-    def __init__(self, on_chunk_ready):
+    def __init__(self, on_chunk_ready, lb_idx, lb_ch, mic_idx):
         self.on_chunk_ready = on_chunk_ready
         self.target_rate = config.AUDIO_SAMPLE_RATE
+        self._lb_device_idx = lb_idx
+        self._lb_channels = lb_ch
+        self._mic_device_idx = mic_idx
 
         # VAD chunking parameters
         self.min_samples = int(self.target_rate * config.AUDIO_MIN_CHUNK_SECONDS)
@@ -44,57 +133,44 @@ class AudioCapture:
         self._mixer_thread = None
 
     def start(self):
+        """Open audio streams and start capture. Instant — no device probing."""
         self._pa = pyaudio.PyAudio()
         self._stop_event.clear()
         self._chunk_index = 0
         self._total_emitted_samples = 0
+        self._lb_buf = np.array([], dtype=np.float32)
+        self._mic_buf = np.array([], dtype=np.float32)
 
-        wasapi = self._pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+        # Open loopback
+        self._lb_stream = self._pa.open(
+            format=pyaudio.paFloat32,
+            channels=self._lb_channels,
+            rate=NATIVE_RATE,
+            input=True,
+            input_device_index=self._lb_device_idx,
+            frames_per_buffer=FRAME_SIZE,
+            stream_callback=self._make_lb_callback(self._lb_channels),
+        )
 
-        # Find and open loopback stream
-        for i in range(self._pa.get_device_count()):
-            dev = self._pa.get_device_info_by_index(i)
-            if dev["hostApi"] == wasapi["index"] and dev.get("isLoopbackDevice", False):
-                lb_ch = dev["maxInputChannels"]
-                print(f"Loopback: {dev['name']} ({lb_ch}ch)")
-                self._lb_stream = self._pa.open(
-                    format=pyaudio.paFloat32,
-                    channels=lb_ch,
-                    rate=NATIVE_RATE,
-                    input=True,
-                    input_device_index=i,
-                    frames_per_buffer=FRAME_SIZE,
-                    stream_callback=self._make_lb_callback(lb_ch),
-                )
-                break
-
-        if not self._lb_stream:
-            raise RuntimeError("No WASAPI loopback device found")
-
-        # Find and open microphone stream
-        mic_idx = self._find_best_mic(wasapi["index"])
-        if mic_idx is not None:
-            dev = self._pa.get_device_info_by_index(mic_idx)
-            print(f"Microphone: {dev['name']}")
+        # Open microphone
+        if self._mic_device_idx is not None:
             try:
                 self._mic_stream = self._pa.open(
                     format=pyaudio.paFloat32,
                     channels=1,
                     rate=NATIVE_RATE,
                     input=True,
-                    input_device_index=mic_idx,
+                    input_device_index=self._mic_device_idx,
                     frames_per_buffer=FRAME_SIZE,
                     stream_callback=self._mic_callback,
                 )
                 self._has_mic = True
             except Exception as e:
                 print(f"Could not open mic: {e}")
-        else:
-            print("WARNING: No working microphone found")
 
         self._mixer_thread = threading.Thread(target=self._mix_loop, daemon=True)
         self._mixer_thread.start()
-        print("Audio capture started (VAD chunking)")
+        print("Audio capture started")
 
     def stop(self):
         self._stop_event.set()
@@ -123,65 +199,6 @@ class AudioCapture:
     def is_running(self):
         return self._lb_stream is not None and self._lb_stream.is_active()
 
-    def _find_best_mic(self, wasapi_host_idx):
-        """
-        Find the best microphone device. Priority:
-        1. Device matching AUDIO_MIC_DEVICE config (substring match)
-        2. Probe all mics for 1s and pick the loudest (auto-detect)
-        """
-        candidates = []
-        for i in range(self._pa.get_device_count()):
-            dev = self._pa.get_device_info_by_index(i)
-            if (dev["hostApi"] == wasapi_host_idx
-                    and not dev.get("isLoopbackDevice", False)
-                    and dev["maxInputChannels"] > 0):
-                candidates.append((i, dev["name"]))
-
-        if not candidates:
-            return None
-
-        # If user specified a device name, use it
-        if config.AUDIO_MIC_DEVICE:
-            for idx, name in candidates:
-                if config.AUDIO_MIC_DEVICE.lower() in name.lower():
-                    print(f"Mic (configured): {name}")
-                    return idx
-            print(f"WARNING: Configured mic '{config.AUDIO_MIC_DEVICE}' not found")
-
-        # Auto-detect: probe each mic for 1s, pick loudest
-        print("Auto-detecting microphone (probing 1s each)...")
-        best_idx = None
-        best_peak = 0
-
-        for idx, name in candidates:
-            try:
-                stream = self._pa.open(
-                    format=pyaudio.paFloat32, channels=1, rate=NATIVE_RATE,
-                    input=True, input_device_index=idx, frames_per_buffer=FRAME_SIZE,
-                )
-                frames = []
-                for _ in range(10):  # 1 second
-                    data = stream.read(FRAME_SIZE, exception_on_overflow=False)
-                    frames.append(np.frombuffer(data, dtype=np.float32))
-                stream.stop_stream()
-                stream.close()
-
-                audio = np.concatenate(frames)
-                peak = float(np.max(np.abs(audio)))
-                status = "active" if peak > 0.005 else "silent"
-                print(f"  [{idx}] {name}: peak={peak:.4f} ({status})")
-
-                if peak > best_peak:
-                    best_peak = peak
-                    best_idx = idx
-            except Exception as e:
-                print(f"  [{idx}] {name}: error - {e}")
-
-        if best_peak < 0.005:
-            print("WARNING: All microphones appear silent — check your mic or set AUDIO_MIC_DEVICE in .env")
-            # Still return the best one (might just be quiet room)
-        return best_idx
-
     def _make_lb_callback(self, channels):
         def callback(in_data, frame_count, time_info, status):
             raw = np.frombuffer(in_data, dtype=np.float32).reshape(-1, channels)
@@ -200,15 +217,9 @@ class AudioCapture:
         return (None, pyaudio.paContinue)
 
     def _find_silence_boundary(self, audio):
-        """
-        Find the best split point in audio by looking for silence gaps.
-        Scans from the end of the min_chunk region backward to find the latest
-        silence gap. Returns the sample index to split at, or -1 if no silence found.
-        """
         if len(audio) < self.min_samples:
             return -1
 
-        # Compute RMS energy in windows across the audio
         n_windows = len(audio) // self.energy_window
         if n_windows == 0:
             return -1
@@ -218,19 +229,15 @@ class AudioCapture:
             for i in range(n_windows)
         ])
 
-        # Find runs of silence (energy below threshold)
         is_silent = energies < self.silence_threshold
         silence_windows_needed = max(1, self.silence_samples // self.energy_window)
 
-        # Scan from the end backward to find the latest silence gap after min_chunk
         min_window = self.min_samples // self.energy_window
         best_split = -1
 
         for i in range(n_windows - 1, min_window - 1, -1):
-            # Check if there's a silence run ending at or around window i
             start = max(0, i - silence_windows_needed + 1)
             if np.all(is_silent[start:i + 1]):
-                # Split at the middle of the silence gap
                 split_window = (start + i) // 2
                 best_split = split_window * self.energy_window
                 break
@@ -240,7 +247,6 @@ class AudioCapture:
     def _emit_chunk(self, chunk):
         offset = self._total_emitted_samples / self.target_rate
         self.on_chunk_ready(chunk, self._chunk_index, offset)
-        # Advance by (chunk_length - overlap) to track absolute position
         self._total_emitted_samples += len(chunk) - self.overlap_samples
         self._chunk_index += 1
 
@@ -269,36 +275,28 @@ class AudioCapture:
 
             mixed_buffer = np.concatenate([mixed_buffer, new_audio])
 
-            # VAD-based chunking: look for silence boundaries
             if len(mixed_buffer) >= self.min_samples:
                 split = self._find_silence_boundary(mixed_buffer)
 
                 if split > 0:
-                    # Found a silence gap — split there
                     chunk = mixed_buffer[:split].copy()
-                    # Keep overlap for context in next chunk
                     keep_from = max(0, split - self.overlap_samples)
                     mixed_buffer = mixed_buffer[keep_from:]
                     self._emit_chunk(chunk)
 
                 elif len(mixed_buffer) >= self.max_samples:
-                    # Hit max without finding silence — force split at best point
-                    # Try to find any brief dip in energy near the end
                     split = self._find_best_split_near_end(mixed_buffer)
                     chunk = mixed_buffer[:split].copy()
                     keep_from = max(0, split - self.overlap_samples)
                     mixed_buffer = mixed_buffer[keep_from:]
                     self._emit_chunk(chunk)
 
-        # Flush remaining buffer on stop
-        if len(mixed_buffer) > self.target_rate:  # At least 1 second
+        if len(mixed_buffer) > self.target_rate:
             self._emit_chunk(mixed_buffer)
 
         print("Audio capture stopped")
 
     def _find_best_split_near_end(self, audio):
-        """When forced to split at max_samples, find the lowest energy point
-        in the last 3 seconds to minimize mid-word cuts."""
         search_start = max(self.min_samples, len(audio) - self.target_rate * 3)
         n_windows = (len(audio) - search_start) // self.energy_window
 
@@ -313,6 +311,5 @@ class AudioCapture:
             for i in range(n_windows)
         ])
 
-        # Find the lowest energy window
         best_window = np.argmin(energies)
         return search_start + best_window * self.energy_window
