@@ -7,7 +7,7 @@ load_dotenv()
 BASE_DIR = Path(__file__).parent
 
 # Whisper settings
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3-turbo")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8_float32")
 
@@ -15,10 +15,10 @@ WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8_float32")
 AUDIO_SAMPLE_RATE = int(os.getenv("AUDIO_SAMPLE_RATE", "16000"))
 
 # VAD-based chunking: split on silence pauses instead of fixed intervals
-AUDIO_MIN_CHUNK_SECONDS = float(os.getenv("AUDIO_MIN_CHUNK_SECONDS", "2"))
+AUDIO_MIN_CHUNK_SECONDS = float(os.getenv("AUDIO_MIN_CHUNK_SECONDS", "1.5"))
 AUDIO_MAX_CHUNK_SECONDS = float(os.getenv("AUDIO_MAX_CHUNK_SECONDS", "15"))
 AUDIO_SILENCE_THRESHOLD = float(os.getenv("AUDIO_SILENCE_THRESHOLD", "0.005"))
-AUDIO_SILENCE_DURATION_MS = int(os.getenv("AUDIO_SILENCE_DURATION_MS", "400"))
+AUDIO_SILENCE_DURATION_MS = int(os.getenv("AUDIO_SILENCE_DURATION_MS", "300"))
 AUDIO_OVERLAP_SECONDS = float(os.getenv("AUDIO_OVERLAP_SECONDS", "1.0"))
 
 # Microphone device name (substring match). Leave empty to auto-detect loudest mic.
