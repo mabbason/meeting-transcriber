@@ -12,7 +12,7 @@ import numpy as np
 import soundfile as sf
 
 import config
-from capture.audio_capture import AudioCapture, discover_devices
+from capture.audio_capture import AudioCapture, discover_all_devices
 from transcriber.transcription import Transcriber
 from transcriber.diarization import Diarizer
 
@@ -27,21 +27,17 @@ class TranscriptionPipeline:
         self._loop = None
         self._processing_lock = None
         self._prev_words = []
-        self._lb_idx = None
-        self._lb_ch = None
-        self._mic_idx = None
+        self.available_devices = []
 
     def load_models(self):
         self.transcriber.load_model()
         self.diarizer.load_model()
 
         print("Discovering audio devices...")
-        self._lb_idx, self._lb_ch, self._mic_idx = discover_devices()
-        if self._lb_idx is None:
-            print("ERROR: No WASAPI loopback device found")
+        self.available_devices = discover_all_devices()
         print()
 
-    def start_session(self) -> dict:
+    def start_session(self, device_indices: list[int] | None = None) -> dict:
         now = datetime.now()
         session_id = now.strftime("%Y%m%d_%H%M%S")
         session_dir = config.SESSIONS_DIR / session_id
@@ -59,16 +55,37 @@ class TranscriptionPipeline:
         self._processing_lock = asyncio.Lock()
         self._prev_words = []
 
+        # Use provided devices or default to all loopbacks + loudest mic
+        if device_indices:
+            selected = device_indices
+        else:
+            selected = self._default_devices()
+
         self.capture = AudioCapture(
             on_chunk_ready=self._on_chunk_from_thread,
-            lb_idx=self._lb_idx,
-            lb_ch=self._lb_ch,
-            mic_idx=self._mic_idx,
+            devices=selected,
+            all_device_info=self.available_devices,
         )
         self.capture.start()
 
         print(f"Session started: {session_id}")
         return {"id": session_id, "started_at": self.session["started_at"]}
+
+    def _default_devices(self) -> list[int]:
+        """Default selection: first loopback + loudest mic."""
+        selected = []
+        for d in self.available_devices:
+            if d["type"] == "loopback":
+                selected.append(d["index"])
+                break
+        best_mic = max(
+            (d for d in self.available_devices if d["type"] == "microphone"),
+            key=lambda d: d["peak"],
+            default=None,
+        )
+        if best_mic:
+            selected.append(best_mic["index"])
+        return selected
 
     def stop_session(self) -> dict | None:
         if not self.session:

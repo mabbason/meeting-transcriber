@@ -1,10 +1,10 @@
 """
 Audio capture using PyAudioWPatch (WASAPI).
-Captures system audio loopback and microphone, mixes into mono.
-Uses VAD-based chunking: splits on natural speech pauses instead of fixed intervals.
+Supports N audio sources (any mix of loopback + microphones).
+Uses VAD-based chunking: splits on natural speech pauses.
 
-Device discovery happens once at init (slow probe).
-Session start/stop just opens/closes streams (instant).
+Device discovery happens once at server startup.
+Session start/stop opens/closes streams instantly.
 """
 
 import threading
@@ -17,96 +17,78 @@ NATIVE_RATE = 48000
 FRAME_SIZE = 4800  # 100ms at 48kHz
 
 
-def discover_devices():
+def discover_all_devices():
     """
-    Probe all WASAPI devices and select the best loopback + mic.
-    Called once at server startup. Returns (loopback_idx, loopback_channels, mic_idx).
+    Discover all WASAPI audio devices at startup.
+    Returns list of device dicts with keys: index, name, type, channels, peak.
     """
     p = pyaudio.PyAudio()
     wasapi = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+    devices = []
 
-    lb_idx = None
-    lb_ch = None
-    mic_idx = None
-
-    # Find first loopback device
     for i in range(p.get_device_count()):
         dev = p.get_device_info_by_index(i)
-        if dev["hostApi"] == wasapi["index"] and dev.get("isLoopbackDevice", False):
-            lb_idx = i
-            lb_ch = dev["maxInputChannels"]
-            print(f"  Loopback: {dev['name']} ({lb_ch}ch)")
-            break
+        if dev["hostApi"] != wasapi["index"]:
+            continue
 
-    # Find best microphone
-    if config.AUDIO_MIC_DEVICE:
-        # User specified a device name
-        for i in range(p.get_device_count()):
-            dev = p.get_device_info_by_index(i)
-            if (dev["hostApi"] == wasapi["index"]
-                    and not dev.get("isLoopbackDevice", False)
-                    and dev["maxInputChannels"] > 0
-                    and config.AUDIO_MIC_DEVICE.lower() in dev["name"].lower()):
-                mic_idx = i
-                print(f"  Microphone (configured): {dev['name']}")
-                break
-        if mic_idx is None:
-            print(f"  WARNING: Configured mic '{config.AUDIO_MIC_DEVICE}' not found")
+        is_loopback = dev.get("isLoopbackDevice", False)
+        has_input = dev["maxInputChannels"] > 0
 
-    if mic_idx is None:
-        # Auto-detect: probe each mic for 0.5s, pick loudest
-        candidates = []
-        for i in range(p.get_device_count()):
-            dev = p.get_device_info_by_index(i)
-            if (dev["hostApi"] == wasapi["index"]
-                    and not dev.get("isLoopbackDevice", False)
-                    and dev["maxInputChannels"] > 0):
-                candidates.append((i, dev["name"]))
+        if is_loopback:
+            devices.append({
+                "index": i,
+                "name": dev["name"],
+                "type": "loopback",
+                "channels": dev["maxInputChannels"],
+                "peak": 0.0,
+            })
+        elif has_input:
+            # Probe mic for 0.5s to get signal level
+            peak = 0.0
+            try:
+                stream = p.open(
+                    format=pyaudio.paFloat32, channels=1, rate=NATIVE_RATE,
+                    input=True, input_device_index=i, frames_per_buffer=FRAME_SIZE,
+                )
+                frames = []
+                for _ in range(5):
+                    data = stream.read(FRAME_SIZE, exception_on_overflow=False)
+                    frames.append(np.frombuffer(data, dtype=np.float32))
+                stream.stop_stream()
+                stream.close()
+                peak = float(np.max(np.abs(np.concatenate(frames))))
+            except Exception:
+                pass
 
-        if candidates:
-            print("  Auto-detecting microphone...")
-            best_peak = 0
-            for idx, name in candidates:
-                try:
-                    stream = p.open(
-                        format=pyaudio.paFloat32, channels=1, rate=NATIVE_RATE,
-                        input=True, input_device_index=idx, frames_per_buffer=FRAME_SIZE,
-                    )
-                    frames = []
-                    for _ in range(5):  # 0.5 second
-                        data = stream.read(FRAME_SIZE, exception_on_overflow=False)
-                        frames.append(np.frombuffer(data, dtype=np.float32))
-                    stream.stop_stream()
-                    stream.close()
-
-                    audio = np.concatenate(frames)
-                    peak = float(np.max(np.abs(audio)))
-                    status = "active" if peak > 0.005 else "silent"
-                    print(f"    [{idx}] {name}: peak={peak:.4f} ({status})")
-
-                    if peak > best_peak:
-                        best_peak = peak
-                        mic_idx = idx
-                except Exception as e:
-                    print(f"    [{idx}] {name}: error - {e}")
-
-            if mic_idx is not None:
-                dev = p.get_device_info_by_index(mic_idx)
-                print(f"  Selected mic: {dev['name']}")
-            if best_peak < 0.005:
-                print("  WARNING: All mics appear silent — set AUDIO_MIC_DEVICE in .env")
+            devices.append({
+                "index": i,
+                "name": dev["name"],
+                "type": "microphone",
+                "channels": 1,
+                "peak": round(peak, 4),
+            })
 
     p.terminate()
-    return lb_idx, lb_ch, mic_idx
+
+    for d in devices:
+        status = ""
+        if d["type"] == "microphone":
+            status = " (active)" if d["peak"] > 0.005 else " (silent)"
+        print(f"  [{d['index']}] {d['type']:10s} {d['name']}{status}")
+
+    return devices
 
 
 class AudioCapture:
-    def __init__(self, on_chunk_ready, lb_idx, lb_ch, mic_idx):
+    def __init__(self, on_chunk_ready, devices, all_device_info):
+        """
+        devices: list of device index ints to capture from
+        all_device_info: full device list from discover_all_devices()
+        """
         self.on_chunk_ready = on_chunk_ready
         self.target_rate = config.AUDIO_SAMPLE_RATE
-        self._lb_device_idx = lb_idx
-        self._lb_channels = lb_ch
-        self._mic_device_idx = mic_idx
+        self._selected_devices = devices
+        self._device_info = {d["index"]: d for d in all_device_info}
 
         # VAD chunking parameters
         self.min_samples = int(self.target_rate * config.AUDIO_MIN_CHUNK_SECONDS)
@@ -114,76 +96,70 @@ class AudioCapture:
         self.silence_threshold = config.AUDIO_SILENCE_THRESHOLD
         self.silence_samples = int(self.target_rate * config.AUDIO_SILENCE_DURATION_MS / 1000)
         self.overlap_samples = int(self.target_rate * config.AUDIO_OVERLAP_SECONDS)
-
-        # Window for RMS energy calculation (50ms)
         self.energy_window = int(self.target_rate * 0.05)
 
         self._pa = None
-        self._lb_stream = None
-        self._mic_stream = None
+        self._streams = []
         self._stop_event = threading.Event()
         self._chunk_index = 0
         self._total_emitted_samples = 0
 
         self._lock = threading.Lock()
-        self._lb_buf = np.array([], dtype=np.float32)
-        self._mic_buf = np.array([], dtype=np.float32)
-        self._has_mic = False
+        # One buffer per source device
+        self._buffers = {}
 
         self._mixer_thread = None
 
     def start(self):
-        """Open audio streams and start capture. Instant — no device probing."""
         self._pa = pyaudio.PyAudio()
         self._stop_event.clear()
         self._chunk_index = 0
         self._total_emitted_samples = 0
-        self._lb_buf = np.array([], dtype=np.float32)
-        self._mic_buf = np.array([], dtype=np.float32)
+        self._streams = []
+        self._buffers = {idx: np.array([], dtype=np.float32) for idx in self._selected_devices}
 
-        # Open loopback
-        self._lb_stream = self._pa.open(
-            format=pyaudio.paFloat32,
-            channels=self._lb_channels,
-            rate=NATIVE_RATE,
-            input=True,
-            input_device_index=self._lb_device_idx,
-            frames_per_buffer=FRAME_SIZE,
-            stream_callback=self._make_lb_callback(self._lb_channels),
-        )
+        for dev_idx in self._selected_devices:
+            info = self._device_info.get(dev_idx)
+            if not info:
+                print(f"WARNING: Device {dev_idx} not found, skipping")
+                continue
 
-        # Open microphone
-        if self._mic_device_idx is not None:
+            channels = info["channels"]
+            is_loopback = info["type"] == "loopback"
+
             try:
-                self._mic_stream = self._pa.open(
+                stream = self._pa.open(
                     format=pyaudio.paFloat32,
-                    channels=1,
+                    channels=channels,
                     rate=NATIVE_RATE,
                     input=True,
-                    input_device_index=self._mic_device_idx,
+                    input_device_index=dev_idx,
                     frames_per_buffer=FRAME_SIZE,
-                    stream_callback=self._mic_callback,
+                    stream_callback=self._make_callback(dev_idx, channels, is_loopback),
                 )
-                self._has_mic = True
+                self._streams.append(stream)
+                label = "loopback" if is_loopback else "mic"
+                print(f"  Opened [{dev_idx}] {info['name']} ({label})")
             except Exception as e:
-                print(f"Could not open mic: {e}")
+                print(f"  Could not open [{dev_idx}] {info['name']}: {e}")
+
+        if not self._streams:
+            raise RuntimeError("No audio streams could be opened")
 
         self._mixer_thread = threading.Thread(target=self._mix_loop, daemon=True)
         self._mixer_thread.start()
-        print("Audio capture started")
+        print(f"Audio capture started ({len(self._streams)} source(s))")
 
     def stop(self):
         self._stop_event.set()
 
-        if self._lb_stream:
-            self._lb_stream.stop_stream()
-            self._lb_stream.close()
-            self._lb_stream = None
-
-        if self._mic_stream:
-            self._mic_stream.stop_stream()
-            self._mic_stream.close()
-            self._mic_stream = None
+        for stream in self._streams:
+            try:
+                stream.stop_stream()
+                stream.close()
+            except Exception:
+                pass
+        self._streams = []
 
         if self._mixer_thread:
             self._mixer_thread.join(timeout=3)
@@ -197,84 +173,59 @@ class AudioCapture:
 
     @property
     def is_running(self):
-        return self._lb_stream is not None and self._lb_stream.is_active()
+        return any(s.is_active() for s in self._streams)
 
-    def _make_lb_callback(self, channels):
+    def _make_callback(self, dev_idx, channels, is_loopback):
         def callback(in_data, frame_count, time_info, status):
-            raw = np.frombuffer(in_data, dtype=np.float32).reshape(-1, channels)
-            mono = np.mean(raw[:, :2], axis=1)
+            raw = np.frombuffer(in_data, dtype=np.float32)
+            if channels > 1:
+                raw = raw.reshape(-1, channels)
+                mono = np.mean(raw[:, :2], axis=1)
+            else:
+                mono = raw
             mono16k = mono[::3]  # 48kHz -> 16kHz
             with self._lock:
-                self._lb_buf = np.concatenate([self._lb_buf, mono16k])
+                self._buffers[dev_idx] = np.concatenate([self._buffers[dev_idx], mono16k])
             return (None, pyaudio.paContinue)
         return callback
 
-    def _mic_callback(self, in_data, frame_count, time_info, status):
-        mono = np.frombuffer(in_data, dtype=np.float32)
-        mono16k = mono[::3]
-        with self._lock:
-            self._mic_buf = np.concatenate([self._mic_buf, mono16k])
-        return (None, pyaudio.paContinue)
-
-    def _find_silence_boundary(self, audio):
-        if len(audio) < self.min_samples:
-            return -1
-
-        n_windows = len(audio) // self.energy_window
-        if n_windows == 0:
-            return -1
-
-        energies = np.array([
-            np.sqrt(np.mean(audio[i * self.energy_window:(i + 1) * self.energy_window] ** 2))
-            for i in range(n_windows)
-        ])
-
-        is_silent = energies < self.silence_threshold
-        silence_windows_needed = max(1, self.silence_samples // self.energy_window)
-
-        min_window = self.min_samples // self.energy_window
-        best_split = -1
-
-        for i in range(n_windows - 1, min_window - 1, -1):
-            start = max(0, i - silence_windows_needed + 1)
-            if np.all(is_silent[start:i + 1]):
-                split_window = (start + i) // 2
-                best_split = split_window * self.energy_window
-                break
-
-        return best_split
-
-    def _emit_chunk(self, chunk):
-        offset = self._total_emitted_samples / self.target_rate
-        self.on_chunk_ready(chunk, self._chunk_index, offset)
-        self._total_emitted_samples += len(chunk) - self.overlap_samples
-        self._chunk_index += 1
-
     def _mix_loop(self):
         mixed_buffer = np.array([], dtype=np.float32)
+        n_sources = len(self._selected_devices)
 
         while not self._stop_event.is_set():
             self._stop_event.wait(timeout=0.1)
 
             with self._lock:
-                n_lb = len(self._lb_buf)
-                n_mic = len(self._mic_buf)
-
-                if self._has_mic and n_lb > 0 and n_mic > 0:
-                    n = min(n_lb, n_mic)
-                    lb = self._lb_buf[:n].copy()
-                    mc = self._mic_buf[:n].copy()
-                    self._lb_buf = self._lb_buf[n:]
-                    self._mic_buf = self._mic_buf[n:]
-                    new_audio = (lb + mc) * 0.5
-                elif n_lb > 0 and not self._has_mic:
-                    new_audio = self._lb_buf.copy()
-                    self._lb_buf = np.array([], dtype=np.float32)
-                else:
+                # Find how many samples all sources have
+                lengths = [len(self._buffers[idx]) for idx in self._selected_devices
+                           if idx in self._buffers]
+                if not lengths:
                     continue
+
+                if n_sources == 1:
+                    # Single source — just take everything
+                    idx = self._selected_devices[0]
+                    if len(self._buffers[idx]) == 0:
+                        continue
+                    new_audio = self._buffers[idx].copy()
+                    self._buffers[idx] = np.array([], dtype=np.float32)
+                else:
+                    # Multiple sources — take min available across all
+                    n = min(lengths)
+                    if n == 0:
+                        continue
+                    chunks = []
+                    for idx in self._selected_devices:
+                        if idx in self._buffers:
+                            chunks.append(self._buffers[idx][:n].copy())
+                            self._buffers[idx] = self._buffers[idx][n:]
+                    # Mix: sum and divide by source count
+                    new_audio = np.sum(chunks, axis=0) / len(chunks)
 
             mixed_buffer = np.concatenate([mixed_buffer, new_audio])
 
+            # VAD-based chunking
             if len(mixed_buffer) >= self.min_samples:
                 split = self._find_silence_boundary(mixed_buffer)
 
@@ -295,6 +246,38 @@ class AudioCapture:
             self._emit_chunk(mixed_buffer)
 
         print("Audio capture stopped")
+
+    def _emit_chunk(self, chunk):
+        offset = self._total_emitted_samples / self.target_rate
+        self.on_chunk_ready(chunk, self._chunk_index, offset)
+        self._total_emitted_samples += len(chunk) - self.overlap_samples
+        self._chunk_index += 1
+
+    def _find_silence_boundary(self, audio):
+        if len(audio) < self.min_samples:
+            return -1
+
+        n_windows = len(audio) // self.energy_window
+        if n_windows == 0:
+            return -1
+
+        energies = np.array([
+            np.sqrt(np.mean(audio[i * self.energy_window:(i + 1) * self.energy_window] ** 2))
+            for i in range(n_windows)
+        ])
+
+        is_silent = energies < self.silence_threshold
+        silence_windows_needed = max(1, self.silence_samples // self.energy_window)
+
+        min_window = self.min_samples // self.energy_window
+
+        for i in range(n_windows - 1, min_window - 1, -1):
+            start = max(0, i - silence_windows_needed + 1)
+            if np.all(is_silent[start:i + 1]):
+                split_window = (start + i) // 2
+                return split_window * self.energy_window
+
+        return -1
 
     def _find_best_split_near_end(self, audio):
         search_start = max(self.min_samples, len(audio) - self.target_rate * 3)

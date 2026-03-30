@@ -4,6 +4,7 @@ let isRecording = false;
 let timerInterval = null;
 let startTime = null;
 let viewingSessionId = null;
+let availableDevices = [];
 
 function connectWebSocket() {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -29,8 +30,81 @@ function connectWebSocket() {
     };
 }
 
+// --- Device selection ---
+
+async function loadDevices() {
+    const resp = await fetch('/api/devices');
+    availableDevices = await resp.json();
+
+    // Load saved selection from localStorage, fall back to defaults
+    const saved = localStorage.getItem('selectedDevices');
+    let selectedIndices;
+    if (saved) {
+        selectedIndices = new Set(JSON.parse(saved));
+        // Validate saved indices still exist
+        const validIndices = new Set(availableDevices.map(d => d.index));
+        selectedIndices = new Set([...selectedIndices].filter(i => validIndices.has(i)));
+        if (selectedIndices.size === 0) {
+            selectedIndices = new Set(availableDevices.filter(d => d.default).map(d => d.index));
+        }
+    } else {
+        selectedIndices = new Set(availableDevices.filter(d => d.default).map(d => d.index));
+    }
+
+    renderDeviceList(selectedIndices);
+}
+
+function renderDeviceList(selectedIndices) {
+    const list = document.getElementById('device-list');
+
+    if (availableDevices.length === 0) {
+        list.innerHTML = '<p class="empty">No devices found</p>';
+        return;
+    }
+
+    list.innerHTML = availableDevices.map(d => {
+        const checked = selectedIndices.has(d.index) ? 'checked' : '';
+        const icon = d.type === 'loopback' ? '\u{1F50A}' : '\u{1F3A4}';
+        const levelClass = d.type === 'microphone' ? (d.peak > 0.005 ? 'active' : 'silent') : '';
+        const levelDot = d.type === 'microphone' ? `<span class="device-level ${levelClass}" title="peak: ${d.peak}"></span>` : '';
+        // Shorten name for display
+        const shortName = d.name.replace(/\[Loopback\]/i, '').replace(/\(.*?\)/g, '').trim();
+        return `
+            <label class="device-item" title="${d.name}">
+                <input type="checkbox" value="${d.index}" ${checked}
+                       onchange="onDeviceToggle()" ${isRecording ? 'disabled' : ''}>
+                <span class="device-icon">${icon}</span>
+                <span class="device-name">${shortName}</span>
+                ${levelDot}
+            </label>
+        `;
+    }).join('');
+}
+
+function getSelectedDeviceIndices() {
+    const checkboxes = document.querySelectorAll('#device-list input[type="checkbox"]:checked');
+    return Array.from(checkboxes).map(cb => parseInt(cb.value));
+}
+
+function onDeviceToggle() {
+    const selected = getSelectedDeviceIndices();
+    localStorage.setItem('selectedDevices', JSON.stringify(selected));
+}
+
+// --- Session management ---
+
 async function startSession() {
-    const resp = await fetch('/api/session/start', { method: 'POST' });
+    const devices = getSelectedDeviceIndices();
+    if (devices.length === 0) {
+        alert('Select at least one audio source');
+        return;
+    }
+
+    const resp = await fetch('/api/session/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ devices }),
+    });
     const data = await resp.json();
 
     activeSessionId = data.id;
@@ -42,6 +116,9 @@ async function startSession() {
     document.getElementById('status').className = 'status recording';
     document.getElementById('status').textContent = 'Recording';
     document.getElementById('export-bar').style.display = 'none';
+
+    // Disable device checkboxes during recording
+    document.querySelectorAll('#device-list input[type="checkbox"]').forEach(cb => cb.disabled = true);
 
     const transcript = document.getElementById('transcript');
     transcript.innerHTML = '';
@@ -63,6 +140,9 @@ async function stopSession() {
     document.getElementById('btn-stop').disabled = true;
     document.getElementById('status').className = 'status idle';
     document.getElementById('status').textContent = 'Idle';
+
+    // Re-enable device checkboxes
+    document.querySelectorAll('#device-list input[type="checkbox"]').forEach(cb => cb.disabled = false);
 
     if (viewingSessionId) {
         document.getElementById('export-bar').style.display = 'flex';
@@ -147,7 +227,7 @@ async function loadSessions() {
 
 async function viewSession(sessionId) {
     if (isRecording && sessionId !== activeSessionId) {
-        return; // Don't switch away from live session while recording
+        return;
     }
 
     const resp = await fetch(`/api/sessions/${sessionId}`);
@@ -160,7 +240,7 @@ async function viewSession(sessionId) {
     data.segments.forEach(seg => appendSegment(seg));
 
     document.getElementById('export-bar').style.display = 'flex';
-    loadSessions(); // Refresh to update active highlight
+    loadSessions();
 }
 
 async function deleteSession(sessionId) {
@@ -199,6 +279,7 @@ async function pollStatus() {
 
 // Initialize
 connectWebSocket();
+loadDevices();
 loadSessions();
 setInterval(pollStatus, 3000);
 pollStatus();

@@ -5,7 +5,7 @@ FastAPI web server with WebSocket support for real-time transcription display.
 import json
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -25,9 +25,30 @@ async def index():
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/api/devices")
+async def list_devices():
+    default_indices = pipeline._default_devices()
+    devices = []
+    for d in pipeline.available_devices:
+        devices.append({
+            "index": d["index"],
+            "name": d["name"],
+            "type": d["type"],
+            "peak": d["peak"],
+            "default": d["index"] in default_indices,
+        })
+    return JSONResponse(devices)
+
+
 @app.post("/api/session/start")
-async def start_session():
-    result = pipeline.start_session()
+async def start_session(request: Request):
+    device_indices = None
+    try:
+        body = await request.json()
+        device_indices = body.get("devices")
+    except Exception:
+        pass
+    result = pipeline.start_session(device_indices=device_indices)
     return JSONResponse(result)
 
 

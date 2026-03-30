@@ -103,6 +103,55 @@ header h1 { font-size: 18px; font-weight: 600; }
     letter-spacing: 0.5px;
 }
 
+.device-panel {
+    border-bottom: 1px solid var(--surface2);
+    padding-bottom: 4px;
+}
+
+.device-list { padding: 0 8px 4px; }
+
+.device-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+.device-item:hover { background: rgba(255,255,255,0.05); }
+
+.device-item input[type="checkbox"] {
+    accent-color: var(--accent-green);
+    cursor: pointer;
+}
+
+.device-icon {
+    font-size: 14px;
+    width: 18px;
+    text-align: center;
+    flex-shrink: 0;
+}
+
+.device-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text);
+}
+
+.device-level {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: #555;
+}
+.device-level.active { background: var(--accent-green); }
+.device-level.silent { background: #555; }
+
 .session-list { flex: 1; overflow-y: auto; }
 
 .session-item {
