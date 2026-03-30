@@ -79,6 +79,17 @@ async def list_sessions():
     return JSONResponse(pipeline.get_sessions())
 
 
+@app.patch("/api/sessions/{session_id}")
+async def rename_session(session_id: str, request: Request):
+    body = await request.json()
+    title = body.get("title", "").strip()
+    if not title:
+        return JSONResponse({"error": "Title required"}, status_code=400)
+    if pipeline.rename_session(session_id, title):
+        return JSONResponse({"ok": True})
+    return JSONResponse({"error": "Session not found"}, status_code=404)
+
+
 @app.get("/api/sessions/{session_id}")
 async def get_session(session_id: str):
     data = pipeline.get_session_transcript(session_id)

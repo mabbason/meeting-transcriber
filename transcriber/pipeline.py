@@ -329,14 +329,40 @@ class TranscriptionPipeline:
                 dead.add(ws)
         self.websocket_clients -= dead
 
+    def _next_untitled_name(self) -> str:
+        """Generate 'Untitled 001', 'Untitled 002', etc."""
+        max_num = 0
+        if config.SESSIONS_DIR.exists():
+            for session_dir in config.SESSIONS_DIR.iterdir():
+                transcript = session_dir / "transcript.json"
+                if transcript.exists():
+                    data = json.loads(transcript.read_text())
+                    title = data.get("title", "")
+                    if title.startswith("Untitled"):
+                        parts = title.split()
+                        if len(parts) == 2 and parts[1].isdigit():
+                            max_num = max(max_num, int(parts[1]))
+        return f"Untitled {max_num + 1:03d}"
+
     def _save_transcript(self):
         if not self.session:
             return
         transcript_path = self.session["dir"] / "transcript.json"
+
+        # Calculate duration from segments
+        segments = self.session["segments"]
+        duration = 0.0
+        if segments:
+            duration = segments[-1]["end"] - segments[0]["start"]
+
+        title = self.session.get("title") or self._next_untitled_name()
+
         save_data = {
             "id": self.session["id"],
+            "title": title,
             "started_at": self.session["started_at"],
             "ended_at": self.session["ended_at"],
+            "duration": round(duration, 1),
             "segments": self.session["segments"],
         }
         transcript_path.write_text(json.dumps(save_data, indent=2))
@@ -352,11 +378,22 @@ class TranscriptionPipeline:
                 data = json.loads(transcript.read_text())
                 sessions.append({
                     "id": data["id"],
+                    "title": data.get("title", data["id"]),
                     "started_at": data["started_at"],
                     "ended_at": data["ended_at"],
+                    "duration": data.get("duration", 0),
                     "segment_count": len(data.get("segments", [])),
                 })
         return sessions
+
+    def rename_session(self, session_id: str, title: str) -> bool:
+        transcript = config.SESSIONS_DIR / session_id / "transcript.json"
+        if not transcript.exists():
+            return False
+        data = json.loads(transcript.read_text())
+        data["title"] = title.strip()
+        transcript.write_text(json.dumps(data, indent=2))
+        return True
 
     def get_session_transcript(self, session_id: str) -> dict | None:
         transcript = config.SESSIONS_DIR / session_id / "transcript.json"

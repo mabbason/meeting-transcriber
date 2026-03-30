@@ -276,6 +276,13 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
+function formatDuration(seconds) {
+    if (!seconds || seconds <= 0) return '0:00';
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${m}:${String(s).padStart(2, '0')}`;
+}
+
 async function loadSessions() {
     const resp = await fetch('/api/sessions');
     const sessions = await resp.json();
@@ -289,19 +296,56 @@ async function loadSessions() {
     list.innerHTML = sessions.map(s => {
         const date = new Date(s.started_at);
         const dateStr = date.toLocaleDateString('en-US', {
-            month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+            month: 'short', day: 'numeric',
+        }) + ', ' + date.toLocaleTimeString('en-US', {
+            hour: 'numeric', minute: '2-digit',
         });
+        const duration = formatDuration(s.duration);
+        const title = escapeHtml(s.title || s.id);
         const active = s.id === viewingSessionId ? ' active' : '';
         return `
-            <div class="session-item${active}">
+            <div class="session-item${active}" data-id="${s.id}">
                 <div class="session-row" onclick="viewSession('${s.id}')">
-                    <div class="date">${dateStr}</div>
-                    <div class="meta">${s.segment_count} segments</div>
+                    <div class="session-title" ondblclick="event.stopPropagation(); startRename('${s.id}', this)">${title}</div>
+                    <div class="session-meta">
+                        <span class="session-date">${dateStr}</span>
+                        <span class="session-duration">${duration}</span>
+                    </div>
                 </div>
                 <button class="btn-delete" onclick="event.stopPropagation(); deleteSession('${s.id}')" title="Delete session">&times;</button>
             </div>
         `;
     }).join('');
+}
+
+function startRename(sessionId, el) {
+    const current = el.textContent;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'rename-input';
+    input.value = current;
+
+    const finish = async () => {
+        const newTitle = input.value.trim();
+        if (newTitle && newTitle !== current) {
+            await fetch(`/api/sessions/${sessionId}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ title: newTitle }),
+            });
+        }
+        loadSessions();
+    };
+
+    input.addEventListener('blur', finish);
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') input.blur();
+        if (e.key === 'Escape') { input.value = current; input.blur(); }
+    });
+
+    el.replaceWith(input);
+    input.focus();
+    input.select();
 }
 
 async function viewSession(sessionId) {

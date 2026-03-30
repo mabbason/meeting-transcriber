@@ -216,14 +216,52 @@ header h1 { font-size: 18px; font-weight: 600; }
     padding: 0;
     border-bottom: 1px solid rgba(255,255,255,0.05);
     transition: background 0.15s;
+    position: relative;
 }
 
 .session-item:hover { background: var(--surface2); }
-.session-item.active { background: var(--surface2); border-left: 3px solid var(--accent); }
 
-.session-row { flex: 1; padding: 10px 8px 10px 16px; cursor: pointer; }
-.session-row .date { font-size: 13px; }
-.session-row .meta { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+.session-item.active::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: var(--accent);
+    border-radius: 0 2px 2px 0;
+}
+
+.session-row { flex: 1; padding: 8px 8px 8px 12px; cursor: pointer; overflow: hidden; }
+
+.session-title {
+    font-size: 13px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.session-meta {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 2px;
+    font-size: 11px;
+    color: var(--text-dim);
+}
+
+.session-date { white-space: nowrap; }
+.session-duration { white-space: nowrap; margin-left: 8px; }
+
+.rename-input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--accent);
+    color: var(--text);
+    font-size: 13px;
+    padding: 2px 4px;
+    border-radius: 3px;
+    outline: none;
+}
 
 .btn-delete {
     width: 24px;
