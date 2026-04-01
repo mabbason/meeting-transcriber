@@ -42,7 +42,6 @@ class Diarizer:
             print("Loading pyannote speaker embedding model...")
             self.embedding_model = Inference(
                 "pyannote/embedding",
-                token=config.HF_TOKEN,
                 window="whole",
             )
 
