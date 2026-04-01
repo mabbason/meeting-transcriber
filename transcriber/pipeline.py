@@ -54,6 +54,7 @@ class TranscriptionPipeline:
         self._loop = asyncio.get_event_loop()
         self._processing_lock = asyncio.Lock()
         self._prev_words = []
+        self.diarizer.reset()
 
         # Use provided devices or default to all loopbacks + loudest mic
         if device_indices:
