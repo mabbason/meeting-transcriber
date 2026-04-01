@@ -50,6 +50,12 @@ function connectWebSocket() {
             if (msg.data.active) {
                 msg.data.segments.forEach(seg => appendSegment(seg));
             }
+        } else if (msg.type === 'diarization_complete') {
+            // Re-render transcript with updated speaker labels
+            const transcript = document.getElementById('transcript');
+            transcript.innerHTML = '';
+            msg.data.segments.forEach(seg => appendSegment(seg));
+            showToast('Speaker identification complete');
         }
     };
 

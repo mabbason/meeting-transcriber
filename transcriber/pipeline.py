@@ -97,6 +97,7 @@ class TranscriptionPipeline:
         segment_count = len(self.session["segments"])
 
         if segment_count > 0:
+            self._run_post_session_diarization()
             self._save_transcript()
         else:
             # Remove empty session directory
@@ -115,6 +116,108 @@ class TranscriptionPipeline:
         print(f"Session stopped: {self.session['id']} ({segment_count} segments)")
         self.session = None
         return result
+
+    def _run_post_session_diarization(self):
+        """Run diarization on the full session audio after recording stops."""
+        if self.diarizer.pipeline is None:
+            return
+
+        segments = self.session["segments"]
+        if not segments:
+            return
+
+        try:
+            import glob
+            import torch
+
+            # Load and concatenate all audio chunks
+            chunk_files = sorted(glob.glob(str(self.session["dir"] / "chunk_*.wav")))
+            if not chunk_files:
+                return
+
+            all_audio = []
+            for f in chunk_files:
+                audio, _ = sf.read(f)
+                all_audio.append(audio)
+            full_audio = np.concatenate(all_audio)
+
+            print(f"Post-session diarization: {len(full_audio)/config.AUDIO_SAMPLE_RATE:.1f}s audio")
+
+            waveform = torch.tensor(full_audio, dtype=torch.float32).unsqueeze(0)
+            result = self.diarizer.pipeline(
+                {"waveform": waveform, "sample_rate": config.AUDIO_SAMPLE_RATE}
+            )
+
+            # Extract speaker annotation (pyannote 4.0 vs 3.x)
+            if hasattr(result, 'speaker_diarization'):
+                annotation = result.speaker_diarization
+            else:
+                annotation = result
+
+            # Build speaker timeline
+            speaker_timeline = []
+            for turn, _, label in annotation.itertracks(yield_label=True):
+                speaker_timeline.append({
+                    "start": turn.start,
+                    "end": turn.end,
+                    "label": label,
+                })
+
+            # Build consistent speaker label map
+            label_map = {}
+            next_id = 1
+            for t in speaker_timeline:
+                if t["label"] not in label_map:
+                    label_map[t["label"]] = f"Speaker {next_id}"
+                    next_id += 1
+
+            # Assign speaker labels to transcript segments by overlap
+            for seg in segments:
+                best_overlap = 0
+                best_label = "Speaker"
+                for t in speaker_timeline:
+                    overlap_start = max(seg["start"], t["start"])
+                    overlap_end = min(seg["end"], t["end"])
+                    overlap = max(0, overlap_end - overlap_start)
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_label = label_map[t["label"]]
+                seg["speaker"] = best_label
+
+            speakers_found = len(label_map)
+            print(f"Post-session diarization complete: {speakers_found} speaker(s) identified")
+
+            # Broadcast updated segments with speaker labels to connected clients
+            if self._loop and speakers_found > 1:
+                import json
+                message = json.dumps({
+                    "type": "diarization_complete",
+                    "data": {
+                        "segments": [
+                            {
+                                "start": s["start"],
+                                "end": s["end"],
+                                "text": s["text"],
+                                "speaker": s.get("speaker", "Speaker"),
+                            }
+                            for s in segments
+                        ],
+                    },
+                })
+                dead = set()
+                for ws in self.websocket_clients:
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            ws.send_text(message), self._loop
+                        )
+                    except Exception:
+                        dead.add(ws)
+                self.websocket_clients -= dead
+
+        except Exception as e:
+            print(f"Post-session diarization error: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _on_chunk_from_thread(self, audio: np.ndarray, chunk_index: int, offset: float):
         if self._loop and self.session:
@@ -171,22 +274,10 @@ class TranscriptionPipeline:
             # Rebuild segments from deduped words
             merged_segments = self._words_to_segments(deduped_words, segments)
 
-            # Diarize
-            chunk_segments = []
+            # Add segments with generic speaker label during live recording
+            # Full diarization runs post-session on the complete audio
             for seg in merged_segments:
-                chunk_segments.append({
-                    **seg,
-                    "start": seg["start"] - offset,
-                    "end": seg["end"] - offset,
-                })
-
-            diarized = await loop.run_in_executor(
-                None, self.diarizer.diarize, audio, chunk_segments
-            )
-
-            for seg in diarized:
-                seg["start"] = round(seg["start"] + offset, 1)
-                seg["end"] = round(seg["end"] + offset, 1)
+                seg["speaker"] = "Speaker"
                 self.session["segments"].append(seg)
                 await self._broadcast(seg)
 
