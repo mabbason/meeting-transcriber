@@ -45,12 +45,14 @@ class Diarizer:
                 window="whole",
             )
 
-            if torch.cuda.is_available():
-                self.pipeline.to(torch.device("cuda"))
-                self.embedding_model.to(torch.device("cuda"))
-                print("Diarization pipeline loaded (CUDA)")
-            else:
-                print("Diarization pipeline loaded (CPU)")
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.pipeline.to(device)
+            # Inference handles device internally via its model
+            try:
+                self.embedding_model.to(device)
+            except (AttributeError, TypeError):
+                pass  # Some pyannote versions don't support .to() on Inference
+            print(f"Diarization pipeline loaded ({device})")
 
             DIARIZATION_AVAILABLE = True
         except Exception as e:
