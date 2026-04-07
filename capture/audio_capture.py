@@ -79,6 +79,8 @@ class AudioCapture:
         self._pa = None
         self._streams = []
         self._stop_event = threading.Event()
+
+        # Single-source state (used when not dual-source)
         self._chunk_index = 0
         self._total_emitted_samples = 0
 
@@ -88,6 +90,12 @@ class AudioCapture:
 
         self._mixer_thread = None
 
+        # Dual-source: separate mic and system device groups
+        self._dual_source = False
+        self._mic_devices = []
+        self._sys_devices = []
+        self._source_state = {}  # "mic"/"system" -> {chunk_index, total_emitted}
+
     def start(self):
         self._pa = pyaudio.PyAudio()
         self._stop_event.clear()
@@ -95,6 +103,19 @@ class AudioCapture:
         self._total_emitted_samples = 0
         self._streams = []
         self._buffers = {idx: np.array([], dtype=np.float32) for idx in self._selected_devices}
+
+        # Classify devices into mic vs system groups
+        self._mic_devices = [idx for idx in self._selected_devices
+                             if self._device_info.get(idx, {}).get("type") == "microphone"]
+        self._sys_devices = [idx for idx in self._selected_devices
+                             if self._device_info.get(idx, {}).get("type") == "loopback"]
+        self._dual_source = bool(self._mic_devices and self._sys_devices)
+
+        if self._dual_source:
+            self._source_state = {
+                "mic": {"chunk_index": 0, "total_emitted": 0},
+                "system": {"chunk_index": 0, "total_emitted": 0},
+            }
 
         for dev_idx in self._selected_devices:
             info = self._device_info.get(dev_idx)
@@ -168,14 +189,19 @@ class AudioCapture:
         return callback
 
     def _mix_loop(self):
+        if self._dual_source:
+            self._mix_loop_dual()
+        else:
+            self._mix_loop_single()
+
+    def _mix_loop_single(self):
+        """Original single-stream mixing: all devices → one buffer → VAD → emit."""
         mixed_buffer = np.array([], dtype=np.float32)
-        n_sources = len(self._selected_devices)
 
         while not self._stop_event.is_set():
             self._stop_event.wait(timeout=0.1)
 
             with self._lock:
-                # Collect all sources that have data
                 active_chunks = []
                 for idx in self._selected_devices:
                     if idx in self._buffers and len(self._buffers[idx]) > 0:
@@ -185,12 +211,10 @@ class AudioCapture:
                     continue
 
                 if len(active_chunks) == 1:
-                    # Only one source has data — use it directly
                     idx = active_chunks[0][0]
                     new_audio = self._buffers[idx].copy()
                     self._buffers[idx] = np.array([], dtype=np.float32)
                 else:
-                    # Multiple sources have data — take min available and mix
                     n = min(length for _, length in active_chunks)
                     chunks = []
                     for idx, _ in active_chunks:
@@ -202,34 +226,101 @@ class AudioCapture:
                         new_audio /= peak
 
             mixed_buffer = np.concatenate([mixed_buffer, new_audio])
-
-            # VAD-based chunking
-            if len(mixed_buffer) >= self.min_samples:
-                split = self._find_silence_boundary(mixed_buffer)
-
-                if split > 0:
-                    chunk = mixed_buffer[:split].copy()
-                    keep_from = max(0, split - self.overlap_samples)
-                    mixed_buffer = mixed_buffer[keep_from:]
-                    self._emit_chunk(chunk)
-
-                elif len(mixed_buffer) >= self.max_samples:
-                    split = self._find_best_split_near_end(mixed_buffer)
-                    chunk = mixed_buffer[:split].copy()
-                    keep_from = max(0, split - self.overlap_samples)
-                    mixed_buffer = mixed_buffer[keep_from:]
-                    self._emit_chunk(chunk)
+            mixed_buffer = self._vad_and_emit(mixed_buffer, source=None)
 
         if len(mixed_buffer) > self.target_rate:
-            self._emit_chunk(mixed_buffer)
+            self._emit_chunk(mixed_buffer, source=None)
 
         print("Audio capture stopped")
 
-    def _emit_chunk(self, chunk):
-        offset = self._total_emitted_samples / self.target_rate
-        self.on_chunk_ready(chunk, self._chunk_index, offset)
-        self._total_emitted_samples += len(chunk) - self.overlap_samples
-        self._chunk_index += 1
+    def _mix_loop_dual(self):
+        """Dual-source: mic and system get independent VAD buffers and emit separately."""
+        mic_buffer = np.array([], dtype=np.float32)
+        sys_buffer = np.array([], dtype=np.float32)
+
+        while not self._stop_event.is_set():
+            self._stop_event.wait(timeout=0.1)
+
+            with self._lock:
+                # Collect mic group
+                mic_audio = self._collect_group(self._mic_devices)
+                # Collect system group
+                sys_audio = self._collect_group(self._sys_devices)
+
+            if mic_audio is not None:
+                mic_buffer = np.concatenate([mic_buffer, mic_audio])
+            if sys_audio is not None:
+                sys_buffer = np.concatenate([sys_buffer, sys_audio])
+
+            mic_buffer = self._vad_and_emit(mic_buffer, source="mic")
+            sys_buffer = self._vad_and_emit(sys_buffer, source="system")
+
+        if len(mic_buffer) > self.target_rate:
+            self._emit_chunk(mic_buffer, source="mic")
+        if len(sys_buffer) > self.target_rate:
+            self._emit_chunk(sys_buffer, source="system")
+
+        print("Audio capture stopped")
+
+    def _collect_group(self, device_indices):
+        """Collect and mix audio from a group of devices. Called under self._lock."""
+        active = []
+        for idx in device_indices:
+            if idx in self._buffers and len(self._buffers[idx]) > 0:
+                active.append((idx, len(self._buffers[idx])))
+
+        if not active:
+            return None
+
+        if len(active) == 1:
+            idx = active[0][0]
+            audio = self._buffers[idx].copy()
+            self._buffers[idx] = np.array([], dtype=np.float32)
+            return audio
+
+        n = min(length for _, length in active)
+        chunks = []
+        for idx, _ in active:
+            chunks.append(self._buffers[idx][:n].copy())
+            self._buffers[idx] = self._buffers[idx][n:]
+        mixed = np.sum(chunks, axis=0)
+        peak = np.max(np.abs(mixed))
+        if peak > 1.0:
+            mixed /= peak
+        return mixed
+
+    def _vad_and_emit(self, buffer, source):
+        """Run VAD chunking on a buffer, emit ready chunks. Returns remaining buffer."""
+        if len(buffer) >= self.min_samples:
+            split = self._find_silence_boundary(buffer)
+
+            if split > 0:
+                chunk = buffer[:split].copy()
+                keep_from = max(0, split - self.overlap_samples)
+                buffer = buffer[keep_from:]
+                self._emit_chunk(chunk, source=source)
+
+            elif len(buffer) >= self.max_samples:
+                split = self._find_best_split_near_end(buffer)
+                chunk = buffer[:split].copy()
+                keep_from = max(0, split - self.overlap_samples)
+                buffer = buffer[keep_from:]
+                self._emit_chunk(chunk, source=source)
+
+        return buffer
+
+    def _emit_chunk(self, chunk, source=None):
+        if self._dual_source and source in self._source_state:
+            state = self._source_state[source]
+            offset = state["total_emitted"] / self.target_rate
+            self.on_chunk_ready(chunk, state["chunk_index"], offset, source)
+            state["total_emitted"] += len(chunk) - self.overlap_samples
+            state["chunk_index"] += 1
+        else:
+            offset = self._total_emitted_samples / self.target_rate
+            self.on_chunk_ready(chunk, self._chunk_index, offset, None)
+            self._total_emitted_samples += len(chunk) - self.overlap_samples
+            self._chunk_index += 1
 
     def _find_silence_boundary(self, audio):
         if len(audio) < self.min_samples:

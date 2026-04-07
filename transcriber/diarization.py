@@ -217,3 +217,10 @@ class Diarizer:
         self.speaker_map = {}
         self.speaker_embeddings = {}
         self.next_speaker_id = 1
+
+    def reset_with_offset(self, next_speaker_id: int):
+        """Reset state with speaker numbering starting at a given ID.
+        Used in dual-source mode where Speaker 1 is reserved for mic input."""
+        self.speaker_map = {}
+        self.speaker_embeddings = {}
+        self.next_speaker_id = next_speaker_id

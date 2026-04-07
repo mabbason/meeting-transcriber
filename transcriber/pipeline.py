@@ -27,6 +27,8 @@ class TranscriptionPipeline:
         self._loop = None
         self._processing_lock = None
         self._prev_words = []
+        self._prev_words_by_source = {}
+        self._dual_source_mode = False
         self.available_devices = []
 
     def load_models(self):
@@ -43,24 +45,32 @@ class TranscriptionPipeline:
         session_dir = config.SESSIONS_DIR / session_id
         session_dir.mkdir(parents=True, exist_ok=True)
 
+        # Use provided devices or default to all loopbacks + loudest mic
+        if device_indices:
+            selected = device_indices
+        else:
+            selected = self._default_devices()
+
+        # Detect dual-source: both mic and loopback types present
+        device_map = {d["index"]: d for d in self.available_devices}
+        has_mic = any(device_map.get(i, {}).get("type") == "microphone" for i in selected)
+        has_loopback = any(device_map.get(i, {}).get("type") == "loopback" for i in selected)
+        self._dual_source_mode = has_mic and has_loopback
+
         self.session = {
             "id": session_id,
             "started_at": now.isoformat(),
             "ended_at": None,
             "segments": [],
             "dir": session_dir,
+            "dual_source": self._dual_source_mode,
         }
 
         self._loop = asyncio.get_event_loop()
         self._processing_lock = asyncio.Lock()
         self._prev_words = []
+        self._prev_words_by_source = {}
         self.diarizer.reset()
-
-        # Use provided devices or default to all loopbacks + loudest mic
-        if device_indices:
-            selected = device_indices
-        else:
-            selected = self._default_devices()
 
         self.capture = AudioCapture(
             on_chunk_ready=self._on_chunk_from_thread,
@@ -149,13 +159,21 @@ class TranscriptionPipeline:
         if not segments:
             return
 
+        dual_source = session.get("dual_source", False)
+
         try:
             import glob
             import torch
 
-            # Load and concatenate all audio chunks
-            chunk_files = sorted(glob.glob(str(session["dir"] / "chunk_*.wav")))
-            if not chunk_files:
+            # In dual-source mode, only diarize system audio
+            if dual_source:
+                chunk_files = sorted(glob.glob(str(session["dir"] / "sys_chunk_*.wav")))
+                target_segments = [s for s in segments if s.get("source") == "system"]
+            else:
+                chunk_files = sorted(glob.glob(str(session["dir"] / "chunk_*.wav")))
+                target_segments = segments
+
+            if not chunk_files or not target_segments:
                 return
 
             all_audio = []
@@ -164,7 +182,8 @@ class TranscriptionPipeline:
                 all_audio.append(audio)
             full_audio = np.concatenate(all_audio)
 
-            print(f"Post-session diarization: {len(full_audio)/config.AUDIO_SAMPLE_RATE:.1f}s audio")
+            src_label = " (system audio only)" if dual_source else ""
+            print(f"Post-session diarization{src_label}: {len(full_audio)/config.AUDIO_SAMPLE_RATE:.1f}s audio")
 
             waveform = torch.tensor(full_audio, dtype=torch.float32).unsqueeze(0)
             result = self.diarizer.pipeline(
@@ -187,17 +206,18 @@ class TranscriptionPipeline:
                 })
 
             # Build consistent speaker label map
+            # In dual-source mode, start at Speaker 2 (Speaker 1 = mic user)
+            next_id = 2 if dual_source else 1
             label_map = {}
-            next_id = 1
             for t in speaker_timeline:
                 if t["label"] not in label_map:
                     label_map[t["label"]] = f"Speaker {next_id}"
                     next_id += 1
 
-            # Assign speaker labels to transcript segments by overlap
-            for seg in segments:
+            # Assign speaker labels to target segments by overlap
+            for seg in target_segments:
                 best_overlap = 0
-                best_label = "Speaker"
+                best_label = seg.get("speaker", "Speaker")
                 for t in speaker_timeline:
                     overlap_start = max(seg["start"], t["start"])
                     overlap_end = min(seg["end"], t["end"])
@@ -208,10 +228,11 @@ class TranscriptionPipeline:
                 seg["speaker"] = best_label
 
             speakers_found = len(label_map)
-            print(f"Post-session diarization complete: {speakers_found} speaker(s) identified")
+            mic_note = " (+ Speaker 1 from mic)" if dual_source else ""
+            print(f"Post-session diarization complete: {speakers_found} speaker(s) identified{mic_note}")
 
             # Broadcast updated segments with speaker labels to connected clients
-            if self._loop and speakers_found > 1:
+            if self._loop:
                 import json
                 message = json.dumps({
                     "type": "diarization_complete",
@@ -242,13 +263,14 @@ class TranscriptionPipeline:
             import traceback
             traceback.print_exc()
 
-    def _on_chunk_from_thread(self, audio: np.ndarray, chunk_index: int, offset: float):
+    def _on_chunk_from_thread(self, audio: np.ndarray, chunk_index: int, offset: float, source: str | None = None):
         if self._loop and self.session:
             peak = np.max(np.abs(audio))
             dur = len(audio) / config.AUDIO_SAMPLE_RATE
-            print(f"Chunk {chunk_index}: {dur:.1f}s, peak={peak:.4f}, offset={offset:.1f}s")
+            src_label = f" [{source}]" if source else ""
+            print(f"Chunk {chunk_index}{src_label}: {dur:.1f}s, peak={peak:.4f}, offset={offset:.1f}s")
             future = asyncio.run_coroutine_threadsafe(
-                self._process_chunk(audio, chunk_index, offset),
+                self._process_chunk(audio, chunk_index, offset, source),
                 self._loop,
             )
             future.add_done_callback(self._chunk_done_callback)
@@ -262,12 +284,19 @@ class TranscriptionPipeline:
             import traceback
             traceback.print_exc()
 
-    async def _process_chunk(self, audio: np.ndarray, chunk_index: int, offset: float):
+    async def _process_chunk(self, audio: np.ndarray, chunk_index: int, offset: float, source: str | None = None):
         if not self.session:
             return
 
         async with self._processing_lock:
-            chunk_path = self.session["dir"] / f"chunk_{chunk_index:04d}.wav"
+            # Source-aware chunk filenames
+            if self._dual_source_mode and source == "mic":
+                chunk_path = self.session["dir"] / f"mic_chunk_{chunk_index:04d}.wav"
+            elif self._dual_source_mode and source == "system":
+                chunk_path = self.session["dir"] / f"sys_chunk_{chunk_index:04d}.wav"
+            else:
+                chunk_path = self.session["dir"] / f"chunk_{chunk_index:04d}.wav"
+
             sf.write(str(chunk_path), audio, config.AUDIO_SAMPLE_RATE)
 
             peak = np.max(np.abs(audio))
@@ -288,8 +317,12 @@ class TranscriptionPipeline:
             for seg in segments:
                 all_words.extend(seg.get("words", []))
 
-            # Deduplicate against previous chunk's trailing words
-            deduped_words = self._dedup_words(all_words)
+            # Deduplicate against previous chunk's trailing words (per-source)
+            if self._dual_source_mode and source:
+                prev_words = self._prev_words_by_source.get(source, [])
+            else:
+                prev_words = self._prev_words
+            deduped_words = self._dedup_words(all_words, prev_words)
 
             if not deduped_words:
                 return
@@ -297,21 +330,34 @@ class TranscriptionPipeline:
             # Rebuild segments from deduped words
             merged_segments = self._words_to_segments(deduped_words, segments)
 
-            # Add segments with generic speaker label during live recording
-            # Full diarization runs post-session on the complete audio
+            # Assign speaker labels based on mode and source
+            if self._dual_source_mode:
+                if source == "mic":
+                    speaker_label = "Speaker 1"
+                else:
+                    speaker_label = "Speaker 2"
+            else:
+                speaker_label = "Speaker"
+
             for seg in merged_segments:
-                seg["speaker"] = "Speaker"
+                seg["speaker"] = speaker_label
+                if self._dual_source_mode and source:
+                    seg["source"] = source
                 self.session["segments"].append(seg)
                 await self._broadcast(seg)
 
-            # Store trailing words for next chunk's dedup
-            self._prev_words = all_words[-20:] if all_words else []
+            # Store trailing words for next chunk's dedup (per-source)
+            trailing = all_words[-20:] if all_words else []
+            if self._dual_source_mode and source:
+                self._prev_words_by_source[source] = trailing
+            else:
+                self._prev_words = trailing
 
     @staticmethod
     def _normalize_word(w: str) -> str:
         return w.strip().lower().rstrip(".,!?;:'\"").lstrip("'\"")
 
-    def _dedup_words(self, new_words: list[dict]) -> list[dict]:
+    def _dedup_words(self, new_words: list[dict], prev_words: list[dict] | None = None) -> list[dict]:
         """
         Remove words from the start of new_words that overlap with the
         previous chunk's trailing words.
@@ -322,13 +368,15 @@ class TranscriptionPipeline:
         2. Sequence alignment: find where a contiguous run of new words
            matches a contiguous run in prev_words, and skip past it.
         """
-        if not self._prev_words or not new_words:
+        if prev_words is None:
+            prev_words = self._prev_words
+        if not prev_words or not new_words:
             return new_words
 
-        prev_texts = [self._normalize_word(w["word"]) for w in self._prev_words]
+        prev_texts = [self._normalize_word(w["word"]) for w in prev_words]
         new_texts = [self._normalize_word(w["word"]) for w in new_words]
 
-        last_prev_end = self._prev_words[-1]["end"]
+        last_prev_end = prev_words[-1]["end"]
 
         # Strategy 1: timestamp — skip new words that fall before the last
         # emitted word's end time
@@ -488,6 +536,7 @@ class TranscriptionPipeline:
             "started_at": self.session["started_at"],
             "ended_at": self.session["ended_at"],
             "duration": round(duration, 1),
+            "dual_source": self.session.get("dual_source", False),
             "segments": self.session["segments"],
         }
         transcript_path.write_text(json.dumps(save_data, indent=2))

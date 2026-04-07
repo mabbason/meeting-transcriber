@@ -113,6 +113,8 @@ def reset_pipeline():
     pipeline.capture = None
     pipeline.websocket_clients = set()
     pipeline._prev_words = []
+    pipeline._prev_words_by_source = {}
+    pipeline._dual_source_mode = False
     pipeline.available_devices = [
         {"index": 1, "name": "Test Mic", "type": "microphone", "channels": 1},
         {"index": 2, "name": "Test Loopback", "type": "loopback", "channels": 2},
